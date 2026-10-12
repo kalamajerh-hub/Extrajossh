@@ -1,0 +1,175 @@
+const express = require('express');
+const app = express();
+app.use(express.json());
+
+// ---------------------------------------------------------
+// DATABASE SIMULASI & STATE
+// ---------------------------------------------------------
+const db = {
+    tariffs: {
+        currentVersion: "v2026-10",
+        lpm: { 50: 80, 100: 160, 200: 320, 300: 480, 400: 640, 500: 800, 600: 960, 700: 1120, 800: 1280, 900: 1440, 1000: 1600 },
+        lpfp: { 50: 100, 100: 200, 200: 400, 300: 600, 400: 800, 500: 1000 },
+        addons: { record: 100, store: 200, poster: 100, video: 150, adult18: 100 },
+        internal: { LPM: 1.2, LPFP: 1.8 } // Tarif komisi internal tim
+    },
+    orders: [],
+    rekapGajiLogs: [],
+    auditLogs: []
+};
+
+// ---------------------------------------------------------
+// 1. MODUL KALKULASI HARGA & DETEKSI INRUSH OTOMATIS
+// ---------------------------------------------------------
+function kalkulasiHargaDanInrush(dataPesanan, tarifAktif) {
+    const { jenisLayanan, jumlah, addons = [], deadline, waktuDibuat } = dataPesanan;
+    
+    // Harga Dasar
+    let hargaDasar = 0;
+    const priceTable = jenisLayanan === 'LPM' ? tarifAktif.lpm : tarifAktif.lpfp;
+    if (priceTable[jumlah]) {
+        hargaDasar = priceTable[jumlah];
+    } else {
+        const baseUnit = jenisLayanan === 'LPM' ? (1600 / 1000) : (1000 / 500);
+        hargaDasar = Math.round(jumlah * baseUnit);
+    }
+
+    // Biaya Layanan Tambahan
+    let totalAddons = 0;
+    addons.forEach(addon => {
+        if (tarifAktif.addons[addon]) totalAddons += tarifAktif.addons[addon];
+    });
+
+    // Deteksi Inrush Otomatis
+    let biayaInrush = 0;
+    let statusInrush = "Tidak";
+    const diffHours = (new Date(deadline) - new Date(waktuDibuat)) / (1000 * 60 * 60);
+    
+    if (jumlah < 3000) {
+        if (diffHours < 1) { biayaInrush = 2000; statusInrush = "Ya"; }
+        else if (diffHours < 2) { biayaInrush = 1000; statusInrush = "Ya"; }
+        else if (diffHours < 3) { biayaInrush = 500; statusInrush = "Ya"; }
+    } else if (jumlah >= 3000 && jumlah <= 4999) {
+        if (diffHours < 3) { biayaInrush = 3000; statusInrush = "Ya"; }
+        else if (diffHours < 5) { biayaInrush = 2000; statusInrush = "Ya"; }
+        else if (diffHours < 6) { biayaInrush = 1000; statusInrush = "Ya"; }
+    }
+
+    const totalPembayaran = hargaDasar + totalAddons + biayaInrush;
+    return {
+        hargaDasar, totalAddons, biayaInrush, statusInrush, totalPembayaran,
+        snapshotTarif: { ...tarifAktif, version: tarifAktif.currentVersion } // Tarif Historis
+    };
+}
+
+// ---------------------------------------------------------
+// 2. ENDPOINT PEMBUATAN PESANAN BARU
+// ---------------------------------------------------------
+app.post('/api/orders', (req, res) => {
+    try {
+        const { namaCustomer, nomorCustomer, jenisLayanan, jumlah, durasiHari, sesi, addons, deadline } = req.body;
+        if (!namaCustomer || !nomorCustomer || !jenisLayanan || !jumlah) {
+            return res.status(400).json({ success: false, message: "Data formulir tidak lengkap." });
+        }
+
+        const waktuDibuat = new Date().toISOString();
+        const kalkulasi = kalkulasiHargaDanInrush({ jenisLayanan, jumlah, addons, deadline, waktuDibuat }, db.tariffs);
+
+        const newOrder = {
+            id: `ORD-${Date.now()}`,
+            namaCustomer, nomorCustomer, jenisLayanan, jumlah, durasiHari, sesi, addons, deadline, waktuDibuat,
+            ...kalkulasi,
+            statusPengerjaan: "Pending",
+            statusPembayaran: "Belum Bayar"
+        };
+
+        db.orders.push(newOrder);
+        db.auditLogs.push({
+            id: `LOG-${Date.now()}`,
+            aksi: "CREATE_ORDER",
+            keterangan: `Pesanan baru ${namaCustomer} (${jenisLayanan} - ${jumlah}) tercatat.`,
+            waktu: waktuDibuat
+        });
+
+        return res.status(201).json({ success: true, message: "Pesanan berhasil dibuat.", data: newOrder });
+    } catch (error) {
+        return res.status(500).json({ success: false, message: error.message });
+    }
+});
+
+// ---------------------------------------------------------
+// 3. MODUL KALKULASI KOMISI TIM & POTONGAN HARIAN
+// ---------------------------------------------------------
+app.post('/api/owner/komisi-gaji', (req, res) => {
+    try {
+        const { orderId, assignments, dailyLogs, configPotongan } = req.body;
+        
+        // Cari pesanan
+        const order = db.orders.find(o => o.id === orderId);
+        if (!order) return res.status(404).json({ success: false, message: "Pesanan tidak ditemukan." });
+
+        // Validasi Total Pekerjaan Tim
+        const totalDikerjakan = assignments.reduce((sum, item) => sum + item.jumlahPekerjaan, 0);
+        if (totalDikerjakan !== order.jumlah) {
+            return res.status(400).json({ success: false, message: `Total pekerjaan tim (${totalDikerjakan}) tidak sama dengan jumlah pesanan (${order.jumlah}).` });
+        }
+
+        const tarifInternal = db.tariffs.internal[order.jenisLayanan] || 0;
+        
+        // Hitung Komisi & Potongan per Anggota
+        let hasilRekapGaji = assignments.map(assign => {
+            const komisiKotor = assign.jumlahPekerjaan * tarifInternal;
+            let potonganStore = (configPotongan.isMemenuhiStore && assign.terapkanStore) ? (komisiKotor * (configPotongan.persentaseStore || 0.15)) : 0;
+            let potonganTerlambat = assign.isTerlambat ? (komisiKotor * (configPotongan.persentaseTerlambat || 0.30)) : 0; // Hanya pada hari/bagian terkait
+            let pendapatanBersih = komisiKotor - potonganStore - potonganTerlambat;
+
+            const recordLog = {
+                id: `LOG-SALARY-${Date.now()}-${assign.anggotaId}`,
+                tanggal: new Date().toISOString().split('T')[0],
+                orderId,
+                anggotaId: assign.anggotaId,
+                namaAnggota: assign.namaAnggota,
+                alias: assign.alias || assign.namaAnggota,
+                jumlahPekerjaan: assign.jumlahPekerjaan,
+                komisiKotor, potonganStore, potonganTerlambat, pendapatanBersih,
+                statusBayar: "Pending"
+            };
+            db.rekapGajiLogs.push(recordLog);
+            return recordLog;
+        });
+
+        return res.status(200).json({ success: true, message: "Komisi dan rekap gaji berhasil dihitung dan disimpan.", data: hasilRekapGaji });
+    } catch (error) {
+        return res.status(500).json({ success: false, message: error.message });
+    }
+});
+
+// ---------------------------------------------------------
+// 4. ENDPOINT EKSPOR REKAP GAJI KE CSV
+// ---------------------------------------------------------
+app.get('/api/owner/rekap-gaji/export-csv', (req, res) => {
+    try {
+        const { startDate, endDate, statusBayar } = req.query;
+        const filteredData = db.rekapGajiLogs.filter(item => {
+            const matchDate = (!startDate || item.tanggal >= startDate) && (!endDate || item.tanggal <= endDate);
+            const matchStatus = (!statusBayar || item.statusBayar.toLowerCase() === statusBayar.toLowerCase());
+            return matchDate && matchStatus;
+        });
+
+        const csvHeaders = ["Tanggal", "Nama Anggota", "Alias", "Order ID", "Jumlah Pekerjaan", "Komisi Kotor", "Potongan Store", "Potongan Terlambat", "Pendapatan Bersih", "Status Bayar"];
+        const csvRows = filteredData.map(row => [
+            row.tanggal, `"${row.namaAnggota}"`, `"${row.alias}"`, row.orderId, row.jumlahPekerjaan, row.komisiKotor, row.potonganStore, row.potonganTerlambat, row.pendapatanBersih, row.statusBayar
+        ]);
+
+        const csvContent = [csvHeaders.join(","), ...csvRows.map(r => r.join(","))].join("\n");
+        
+        res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+        res.setHeader('Content-Disposition', 'attachment; filename="rekap-gaji-extrajossh.csv"');
+        return res.status(200).send(csvContent);
+    } catch (error) {
+        return res.status(500).json({ success: false, message: error.message });
+    }
+});
+
+// Jalankan Server
+app.listen(3000, () => console.log("Server EXTRAJOSSH aktif di port 3000"));
